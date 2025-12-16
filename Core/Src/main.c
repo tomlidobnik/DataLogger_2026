@@ -23,11 +23,21 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "SDCardUtils.h"
+#include <math.h>
+#include "string.h"
+#include "CanFactory.h"
+#include "nrf.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+typedef struct {
+	uint32_t raw;
+	float voltage;
+	float value;
+} adc_data;
 
 /* USER CODE END PTD */
 
@@ -70,6 +80,115 @@ const osThreadAttr_t defaultTask_attributes = {
 };
 /* USER CODE BEGIN PV */
 
+/* Definitions for loggingTask */
+osThreadId_t loggingTaskHandle;
+const osThreadAttr_t loggingTask_attributes = {
+  .name = "loggingTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+/* Definitions for nrfTask */
+osThreadId_t nrfTaskHandle;
+const osThreadAttr_t nrfTask_attributes = {
+  .name = "nrfTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+uint16_t time_elapsed = 0;
+uint8_t rf_payload[32] = { 0 };
+
+FATFS fs;
+FIL fil;
+char logFileName[32];
+FRESULT loggingRes = FR_NOT_READY;
+uint8_t loggingStarted = 0;
+uint8_t sdPresent = 0;
+uint8_t writeErrorCounter = 0;
+
+uint64_t secondsCounter = 0;
+
+const float vrefCoef = 3.3f / 4096;
+
+uint32_t adc_buff1[4] = { 0 };
+uint32_t adc_buff2[4] = { 0 };
+
+const float Res1 = 4700.0;
+const float InputVoltage = 5.0f;
+const float WaterTemp_COEFICIENT = -30.49;
+const float WaterTemp_VACANT_MEMBER = 258.39;
+
+// Cooling system
+adc_data watterTemp1;
+adc_data watterTemp2;
+adc_data watterPress1;
+adc_data watterPress2;
+
+// Gas pedal
+adc_data apps1;
+adc_data apps2;
+
+adc_data brakePress;
+adc_data stearingAng;
+
+// Speed sensors
+float speed_fr = 0;
+float speed_fl = 0;
+float speed_rr = 0;
+float speed_rl = 0;
+
+// Batteries
+float maxHvCellTemp = 0;
+float minHvCellVoltage = 0;
+float hvVoltage = 0;
+float maxLvCellTemp = 0;
+float minLvCellVoltage = 0;
+float lvVoltage = 0;
+
+float hv_cells[96];
+float hv_current = 0;
+
+// AIR-s
+uint32_t AIRpRaw = 0;
+uint8_t AIRpPos = 0;
+uint32_t AIRmRaw = 0;
+uint8_t AIRmPos = 0;
+
+// GPS
+float latitude = 0;
+float longitude = 0;
+float altitude = 0;
+float gpsSpeed = 0;
+float heading = 0; // To kam si obrnjen
+float directon = 0; // To kam greš
+
+// Suspension
+float bellCrankFR = 0;
+float bellCrankFL = 0;
+float bellCrankRR = 0;
+float bellCrankRL = 0;
+
+// IMU
+float accel_x = 0;
+float accel_y = 0;
+float accel_z = 0;
+float gyro_x = 0;
+float gyro_y = 0;
+float gyro_z = 0;
+
+// Inverter
+float motorTemp = 0;
+float inverterTemp = 0;
+
+uint16_t loggingCounter = 0;
+uint8_t dashSentCounter = 0;
+uint8_t logAIRs = 1;
+uint8_t logHV_Cells = 1;
+
+int maxErr = 0;
+uint8_t logNext = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -90,6 +209,8 @@ static void MX_SPI3_Init(void);
 static void MX_TIM17_Init(void);
 static void MX_ADC3_Init(void);
 void StartDefaultTask(void *argument);
+void StartLoggingTask(void *argument);
+void StartNRFTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -147,6 +268,52 @@ int main(void)
   MX_TIM17_Init();
   MX_ADC3_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start(&htim2);
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+  HAL_ADCEx_Calibration_Start(&hadc3, ADC_SINGLE_ENDED);
+  HAL_ADC_Start_DMA(&hadc2, adc_buff1, 4);
+  HAL_ADC_Start_DMA(&hadc3, adc_buff2, 4);
+
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+    Error_Handler();
+  }
+  if (HAL_CAN_Start(&hcan2) != HAL_OK) {
+    Error_Handler();
+  }
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING)
+      != HAL_OK) {
+    Error_Handler();
+  }
+  if (HAL_CAN_ActivateNotification(&hcan2, CAN_IT_RX_FIFO1_MSG_PENDING)
+      != HAL_OK) {
+    Error_Handler();
+  }
+
+  TIM15->SR &= ~(1 << 0);
+  HAL_TIM_Base_Start_IT(&htim15);
+  TIM8->SR &= ~(1 << 0);
+  HAL_TIM_Base_Start_IT(&htim8);
+
+  loggingRes = initLogging(logFileName, &fs);
+  if (loggingRes == FR_OK) {
+    loggingStarted = 1;
+  }
+
+  HAL_Delay(3000);
+  HAL_TIM_Base_Start(&htim16);
+  HAL_TIM_Base_Start(&htim17);
+  HAL_GPIO_WritePin(GPIOG, CE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOG, CSN_Pin, GPIO_PIN_SET);
+
+  NRF_Write(0x01, 0x00); //Disable Auto Acknowledge for every data pipe
+  NRF_Write(0x04, 0x00); //Disable retransmissions of packets
+  NRF_Write(0x00, 0x5a); //Mask interrupt RX_DR and MAX_RT, go in POWER UP and set module in TX mode
+  HAL_Delay(2);
+
+  FLUSH_TX();
+  Clear_TX_DS_flag();
+  Clear_MAX_RT_flag();
+  TIM17->CNT = 5001;
 
   /* USER CODE END 2 */
 
@@ -175,6 +342,8 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  loggingTaskHandle = osThreadNew(StartLoggingTask, NULL, &loggingTask_attributes);
+  nrfTaskHandle = osThreadNew(StartNRFTask, NULL, &nrfTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -931,6 +1100,170 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+float brakePressureSensitivityFactorAt5V = 0.00952;
+//3.300000
+float brakePressureOffsetFactor_uV = 0.52;
+int32_t stearRaw = 0;
+int32_t stearMidRaw = 2172;
+float maxStearValue = 11.5;
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+	if (hadc->Instance == hadc2.Instance) {
+		watterTemp1.raw = adc_buff1[0];
+		watterTemp1.voltage = watterTemp1.raw * vrefCoef;
+		float tempRes = Res1 / ((InputVoltage / watterTemp1.voltage) - 1.f);
+		watterTemp1.value = WaterTemp_COEFICIENT * log(tempRes)
+				+ WaterTemp_VACANT_MEMBER; // log - logarithm with base e
+
+		watterTemp2.raw = adc_buff1[1];
+		watterTemp2.voltage = watterTemp2.raw * vrefCoef;
+		tempRes = Res1 / ((InputVoltage / watterTemp1.voltage) - 1.f);
+		watterTemp2.value = WaterTemp_COEFICIENT * log(tempRes)
+				+ WaterTemp_VACANT_MEMBER; // log - logarithm with base e
+
+		watterPress1.raw = adc_buff1[2];
+		watterPress1.voltage = watterPress1.raw * vrefCoef;
+
+		watterPress2.raw = adc_buff1[3];
+		watterPress2.voltage = watterPress2.raw * vrefCoef;
+	} else {
+		apps1.raw = adc_buff2[0];
+		apps1.voltage = apps1.raw * vrefCoef;
+
+		apps2.raw = adc_buff2[1];
+		apps2.voltage = apps2.raw * vrefCoef;
+
+		brakePress.raw = adc_buff2[2];
+		brakePress.voltage = brakePress.raw * vrefCoef * 2;
+		brakePress.value = (brakePress.voltage - brakePressureOffsetFactor_uV)
+				/ brakePressureSensitivityFactorAt5V;
+
+		stearRaw = adc_buff2[3] - 500;
+		stearingAng.raw = stearRaw;
+		stearingAng.voltage = stearingAng.raw * vrefCoef;
+		stearingAng.value = (float) ((int32_t) stearingAng.raw - stearMidRaw)
+				/ maxStearValue;
+		if (stearRaw < 0) {
+			stearingAng.raw = stearRaw + 2800 + 500; // Nastavljeno s testom
+			stearingAng.value = ((float) ((int32_t) stearingAng.raw
+					- stearMidRaw) / maxStearValue) * 1.0752689;
+		}
+		stearingAng.value-=10;
+		if(stearingAng.value<-150){
+			stearingAng.value=103;
+		}
+	}
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	if (htim == &htim15) {
+		secondsCounter++;
+	} else if (htim == &htim8) {
+		// tim8 - 100Hz
+		logNext = 1;
+
+		if (dashSentCounter == 0) {
+			dashSentCounter = 1;
+			SendCanMsg1(
+					CreateSendBrakeWater(apps1.raw, brakePress.value,
+							watterTemp1.value, watterPress1.raw));
+		} else {
+			dashSentCounter = 0;
+			SendCanMsg1(CreateSendMotorInverter(inverterTemp, motorTemp));
+		}
+
+		SendCanMsg1(CreateSendCellDataRequest());
+	}
+}
+CAN_RxHeaderTypeDef RxHeader;
+CanPayload RxData;
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+
+	if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData.bytes)
+			!= HAL_OK) {
+		return;
+	}
+	if (RxHeader.RTR == CAN_RTR_DATA) {
+		if (RxHeader.StdId == 0x103) {
+			lvVoltage = (float) RxData.uints[0] / 10000.0f;
+
+		} else if (RxHeader.StdId == 0x101) {
+			minLvCellVoltage = (float) (RxData.uints[0]) / 10000.0f;
+			maxLvCellTemp = (float) RxData.uints[1] / 1000.0f;
+		}
+
+		else if (RxHeader.StdId == 0x011) {
+			minHvCellVoltage = (float) RxData.shorts[0];
+			maxHvCellTemp = (float) RxData.shorts[1];
+//		} else if (RxHeader.StdId == 0x013) {
+		} else if (RxHeader.StdId == 0x7ff) {
+			hvVoltage = (float) RxData.shorts[0];
+			hv_current = (float) RxData.shorts[1];
+		} else if (RxHeader.StdId == 0x012) {
+			uint8_t newAp = 0;
+			uint8_t newAm = 0;
+			AIRpRaw = RxData.uints[0];
+			AIRmRaw = RxData.uints[1];
+
+			if (AIRpRaw < 220 && AIRpRaw > 100) {
+				newAp = 1;
+			} else if (AIRpRaw >= 220) {
+				newAp = 2;
+			} else {
+				newAp = 2;
+			}
+
+			if (newAp != AIRpPos) {
+				AIRpPos = newAp;
+				logAIRs = 1;
+			}
+
+			if (AIRmRaw < 220 && AIRmRaw > 100) {
+				newAm = 1;
+			} else if (AIRmRaw >= 220) {
+				newAm = 2;
+			} else {
+				newAm = 2;
+			}
+
+			if (newAm != AIRmPos) {
+				AIRmPos = newAm;
+				logAIRs = 1;
+			}
+		} else if (RxHeader.StdId >= 0x700 && RxHeader.StdId <= (0x700 + 11)) {
+			uint8_t group = RxHeader.StdId - 0x700;
+			for (uint8_t i = 0; i < 8; i++) {
+				hv_cells[i + 8 * group] = (float) (RxData.bytes[i] + 200)
+						/ 100.0f;
+			}
+			if (RxHeader.StdId == (0x700 + 11)) {
+				logHV_Cells = 1;
+			}
+
+		} else if (RxHeader.StdId == 0x202) {
+			longitude = RxData.floats[0];
+			latitude = RxData.floats[1];
+		}
+	}
+}
+
+void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+
+	if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &RxHeader, RxData.bytes)
+			!= HAL_OK) {
+		return;
+	}
+
+	if (RxHeader.StdId == 0x281) {
+		inverterTemp = RxData.floats[0];
+		motorTemp = RxData.floats[1];
+	} else if (RxHeader.StdId == 0x301) {
+		apps1.value = RxData.floats[0];
+	}
+}
+HAL_StatusTypeDef canRes = HAL_OK;
 
 /* USER CODE END 4 */
 
